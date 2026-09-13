@@ -2,7 +2,9 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
-local remote = ReplicatedStorage.Remotes.BabyAction
+local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("BabyAction")
+
+print("AutoBaby started")
 
 local enabled = false
 
@@ -11,7 +13,7 @@ local enabled = false
 local gui = Instance.new("ScreenGui")
 gui.Name = "AutoBabyTester"
 gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
+gui.Parent = game:GetService("CoreGui")
 
 
 local button = Instance.new("TextButton")
@@ -26,43 +28,72 @@ button.Parent = gui
 button.MouseButton1Click:Connect(function()
 	enabled = not enabled
 
-	button.Text = enabled
+	print("Button clicked")
+	print("AutoBaby:", enabled)
+
+	button.Text = enabled 
 		and "Auto Baby: ON"
 		or "Auto Baby: OFF"
 end)
 
 
 local function attemptPickup(baby)
-	if not enabled then return end
 
-	print("Baby detected:", baby)
+	if not enabled then
+		print("Baby found but AutoBaby is OFF")
+		return
+	end
 
-	task.wait(0.2)
+	print("Attempting pickup:", baby.Name)
+
+	task.wait(0.3)
 
 	local trigger = baby:FindFirstChild("Trigger")
 	local prompt = trigger and trigger:FindFirstChild("PickupPrompt")
 
-	if prompt then
-		print("Pickup prompt found")
-
-		local character = player.Character or player.CharacterAdded:Wait()
-		local root = character:FindFirstChild("HumanoidRootPart")
-
-		if root and trigger then
-			root.CFrame = trigger.CFrame + Vector3.new(0,3,0)
-
-			task.wait(0.5)
-
-			remote:FireServer()
-
-			print("Pickup requested")
-		end
+	if not trigger then
+		print("No Trigger found")
+		return
 	end
+
+	if not prompt then
+		print("No PickupPrompt found")
+		return
+	end
+
+	print("PickupPrompt found")
+
+
+	local character = player.Character or player.CharacterAdded:Wait()
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if not root then
+		print("No HumanoidRootPart")
+		return
+	end
+
+
+	-- Move near baby
+	root.CFrame = trigger.CFrame + Vector3.new(0,3,0)
+
+	task.wait(0.5)
+
+	print("Sending BabyAction")
+
+	-- Same remote used by the original pickup script
+	remote:FireServer()
+
+	print("Pickup requested")
 end
 
 
 workspace.ChildAdded:Connect(function(obj)
+
+	print("Workspace object added:", obj.Name)
+
 	if obj.Name == "BabyPickup" then
+		print("Baby detected!")
 		attemptPickup(obj)
 	end
+
 end)
