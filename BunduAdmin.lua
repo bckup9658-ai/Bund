@@ -1,91 +1,188 @@
 -- BunduAdmin.lua
--- Combined client utility UI
--- Sections: Misc / Gameplay
+-- Misc: Auto Baby, Hitboxes, Low-Health Escape + Return
+-- Gameplay: Honeycomb, Sabotage, RLGL
+-- Preferred Door is intentionally inactive.
+-- No tool cooldown modification is included.
+
+--==================================================
+-- SERVICES / STATE
+--==================================================
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local Workspace = game:GetService("Workspace")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
+assert(player, "Run BunduAdmin on the client.")
+
 local playerGui = player:WaitForChild("PlayerGui")
 
-local CONFIG = {
-	BabyName = "BabyPickup",
-	BabyPromptName = "PickupPrompt",
-	PromptDistance = 100000,
-	HoneycombPath = {"Map", "Honeycomb"},
-	-- Measured from the Star center to the far edge of the standing block.
-	ShapeStandingOffset = Vector3.new(-0.306, 0, -11.490),
-	CarveClicksPerYield = 8,
-	CarvePasses = 4,
-	CameraStableFrames = 3,
-	CookieLockHeight = 2.25,
-	BreakClickInterval = 0.035,
+local VIM
+pcall(function()
+	VIM = game:GetService("VirtualInputManager")
+end)
+
+for _, name in ipairs({
+	"BunduAdminUI",
+	"AutoBabyAdminUI",
+	"AutoBabyUI",
+}) do
+	local previous = playerGui:FindFirstChild(name)
+	if previous then
+		previous:Destroy()
+	end
+end
+
+local S = {
+	closed = false,
+	minimized = false,
+
+	baby = false,
+	hitboxes = false,
+	hitboxSize = 10,
+
+	escape = false,
+	threshold = 25,
+	armed = false,
+
+	carve = false,
+	carving = false,
+	carveToken = 0,
+
+	shape = "Circle",
+	target = nil,
+	barriers = false,
+	lock = false,
+	breaking = false,
+
+	walk = false,
 }
 
-local SHAPES = {"Circle", "Triangle", "Square", "Star", "Umbrella"}
-local SHAPE_SET = {}
-for _, shape in SHAPES do SHAPE_SET[shape] = true end
-
-local old = playerGui:FindFirstChild("BunduAdminUI")
-if old then old:Destroy() end
-
-local state = {
-	destroyed = false,
-	minimized = false,
-	tab = "Misc",
-	autoBaby = false,
-	honeycombEnabled = false,
-	autoCarve = false,
-	selectedShape = "Circle",
-	lastMovedShapeInstance = nil,
-	lastCarvedModel = nil,
-	scanQueued = false,
-	carving = false,
-	selectedTarget = nil,
-	barriersRemoved = false,
-	cookieLock = false,
-	breakCookie = false,
-	breakLoopToken = 0,
+local CONFIG = {
+	CarvePasses = 6,
+	CarveClickTime = 0.035,
+	BreakInterval = 0.15,
+	ArrivalDistance = 8,
 }
 
 local connections = {}
-local activateBaby
+local healthConnections = {}
+local widgets = {}
+
+local detached = {}
+local hitboxOriginals = {}
+local promptOriginals = {}
+
+local savedReturn
+local trackedCharacter
+local trackedHumanoid
+local lockSnapshot
+local walkingHumanoid
+
+local escapeBusy = false
+local clickBusy = false
+local mouseHeld = false
+local mouseX, mouseY = 0, 0
+
+local checkHealth
+local startCarve
+local refreshTargets
+local selectTarget
+
 local function connect(signal, callback)
 	local connection = signal:Connect(callback)
 	table.insert(connections, connection)
 	return connection
 end
 
-local function tween(object, properties, duration)
-	TweenService:Create(object, TweenInfo.new(duration or 0.16, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), properties):Play()
+local function disconnectAll(list)
+	for _, connection in ipairs(list) do
+		connection:Disconnect()
+	end
+	table.clear(list)
 end
 
-local function new(className, properties, parent)
-	local object = Instance.new(className)
-	for property, value in properties do object[property] = value end
+local function characterParts()
+	local character = player.Character
+	if not character then
+		return nil, nil, nil
+	end
+
+	return character,
+		character:FindFirstChildOfClass("Humanoid"),
+		character:FindFirstChild("HumanoidRootPart")
+end
+
+local function findPath(root, ...)
+	for _, name in ipairs({...}) do
+		root = root and root:FindFirstChild(name)
+	end
+	return root
+end
+
+local function eligible(other)
+	return other ~= nil
+		and other ~= player
+		and other.Parent == Players
+		and other.Team ~= nil
+		and other.Team.Name == "Player"
+end
+
+local function cookie(other)
+	return other and findPath(
+		Workspace, "Map", "Honeycomb", "Shapes", other.Name
+	)
+end
+
+local function targetMain()
+	local model = cookie(S.target)
+	local main = model and model:FindFirstChild("Main", true)
+	return main and main:IsA("BasePart") and main or nil
+end
+
+--==================================================
+-- UI HELPERS
+--==================================================
+
+local C = {
+	Background = Color3.fromRGB(16, 18, 27),
+	Panel = Color3.fromRGB(25, 28, 41),
+	Card = Color3.fromRGB(34, 38, 54),
+	Accent = Color3.fromRGB(132, 108, 255),
+	Enabled = Color3.fromRGB(35, 101, 77),
+	Text = Color3.fromRGB(238, 240, 250),
+	Muted = Color3.fromRGB(160, 168, 193),
+}
+
+local function make(class, properties, parent)
+	local object = Instance.new(class)
+	for key, value in pairs(properties) do
+		object[key] = value
+	end
 	object.Parent = parent
 	return object
 end
 
-local function corner(parent, radius)
-	return new("UICorner", {CornerRadius = UDim.new(0, radius or 9)}, parent)
+local function round(object, radius)
+	make("UICorner", {
+		CornerRadius = UDim.new(0, radius or 9),
+	}, object)
 end
 
-local function stroke(parent, color, transparency)
-	return new("UIStroke", {
-		Color = color or Color3.fromRGB(67, 72, 94),
-		Transparency = transparency or 0.35,
-		Thickness = 1,
+local function text(parent, value, size, color)
+	return make("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = value,
+		TextSize = size or 12,
+		TextColor3 = color or C.Text,
+		Font = Enum.Font.GothamMedium,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 	}, parent)
 end
 
--- UI -------------------------------------------------------------------------
-
-local gui = new("ScreenGui", {
+local gui = make("ScreenGui", {
 	Name = "BunduAdminUI",
 	ResetOnSpawn = false,
 	IgnoreGuiInset = true,
@@ -93,895 +190,1509 @@ local gui = new("ScreenGui", {
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, playerGui)
 
-local shadow = new("Frame", {
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(474, 324),
-	BackgroundColor3 = Color3.new(0, 0, 0),
-	BackgroundTransparency = 0.55,
-	BorderSizePixel = 0,
-}, gui)
-corner(shadow, 17)
-
-local main = new("Frame", {
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(464, 314),
-	BackgroundColor3 = Color3.fromRGB(13, 15, 23),
+local window = make("Frame", {
+	Size = UDim2.fromOffset(470, 490),
+	Position = UDim2.new(0.5, -235, 0.5, -245),
+	BackgroundColor3 = C.Background,
 	BorderSizePixel = 0,
 	ClipsDescendants = true,
 }, gui)
-corner(main, 15)
-stroke(main, Color3.fromRGB(86, 91, 127), 0.3)
-new("UIGradient", {
-	Color = ColorSequence.new(Color3.fromRGB(23, 26, 40), Color3.fromRGB(11, 13, 20)),
-	Rotation = 120,
-}, main)
+round(window, 13)
 
-local accent = new("Frame", {
+make("UIStroke", {
+	Color = Color3.fromRGB(75, 68, 107),
+	Thickness = 1,
+}, window)
+
+local accent = make("Frame", {
 	Size = UDim2.new(1, 0, 0, 3),
 	BackgroundColor3 = Color3.new(1, 1, 1),
 	BorderSizePixel = 0,
-}, main)
-new("UIGradient", {
+}, window)
+
+make("UIGradient", {
 	Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 255)),
-		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(126, 88, 255)),
-		ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 75, 184)),
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(92, 185, 255)),
+		ColorSequenceKeypoint.new(1, C.Accent),
 	}),
 }, accent)
 
-local header = new("Frame", {
-	Size = UDim2.new(1, 0, 0, 48), BackgroundTransparency = 1, Active = true,
-}, main)
+local header = make("Frame", {
+	Size = UDim2.new(1, -80, 0, 52),
+	BackgroundTransparency = 1,
+	Active = true,
+}, window)
 
-local logo = new("TextLabel", {
-	Position = UDim2.fromOffset(13, 11), Size = UDim2.fromOffset(27, 27),
-	BackgroundColor3 = Color3.fromRGB(111, 87, 255), BorderSizePixel = 0,
-	Text = "B", TextColor3 = Color3.new(1, 1, 1), TextSize = 14, Font = Enum.Font.GothamBold,
-}, header)
-corner(logo, 8)
+local title = text(header, "BUNDU  /  ADMIN", 16)
+title.Position = UDim2.fromOffset(15, 10)
+title.Size = UDim2.fromOffset(300, 20)
+title.Font = Enum.Font.GothamBold
 
-new("TextLabel", {
-	Position = UDim2.fromOffset(49, 7), Size = UDim2.fromOffset(220, 20),
-	BackgroundTransparency = 1, Text = "BUNDU ADMIN", TextColor3 = Color3.fromRGB(244, 246, 255),
-	TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-}, header)
-new("TextLabel", {
-	Position = UDim2.fromOffset(49, 25), Size = UDim2.fromOffset(220, 14),
-	BackgroundTransparency = 1, Text = "CLIENT CONTROL CENTER", TextColor3 = Color3.fromRGB(112, 117, 142),
-	TextSize = 8, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-}, header)
+local subtitle = text(header, "MISC  •  GAMEPLAY  •  UTILITIES", 9, C.Muted)
+subtitle.Position = UDim2.fromOffset(16, 32)
+subtitle.Size = UDim2.fromOffset(320, 14)
 
-local function headerButton(text, offset)
-	local button = new("TextButton", {
-		Position = UDim2.new(1, offset, 0, 10), Size = UDim2.fromOffset(28, 28),
-		BackgroundColor3 = Color3.fromRGB(31, 34, 48), BorderSizePixel = 0, AutoButtonColor = false,
-		Text = text, TextColor3 = Color3.fromRGB(174, 179, 200), TextSize = 16, Font = Enum.Font.GothamBold,
-	}, header)
-	corner(button, 8)
+local function headerButton(value, x)
+	local button = make("TextButton", {
+		Position = UDim2.fromOffset(x, 12),
+		Size = UDim2.fromOffset(28, 28),
+		BackgroundColor3 = C.Card,
+		BorderSizePixel = 0,
+		Text = value,
+		TextColor3 = C.Text,
+		TextSize = 18,
+		Font = Enum.Font.GothamBold,
+	}, window)
+	round(button, 7)
 	return button
 end
 
-local minimizeButton = headerButton("−", -69)
-local closeButton = headerButton("×", -36)
+local minimizeButton = headerButton("−", 399)
+local closeButton = headerButton("×", 433)
 
-local sidebar = new("Frame", {
-	Position = UDim2.fromOffset(10, 50), Size = UDim2.fromOffset(110, 254),
-	BackgroundColor3 = Color3.fromRGB(18, 20, 31), BackgroundTransparency = 0.12, BorderSizePixel = 0,
-}, main)
-corner(sidebar, 11)
-stroke(sidebar, Color3.fromRGB(59, 64, 85), 0.5)
+local body = make("Frame", {
+	Position = UDim2.fromOffset(10, 58),
+	Size = UDim2.fromOffset(450, 398),
+	BackgroundTransparency = 1,
+}, window)
 
-local pages = new("Frame", {
-	Position = UDim2.fromOffset(128, 50), Size = UDim2.fromOffset(326, 254), BackgroundTransparency = 1,
-}, main)
+local status = text(window, "Ready", 10, C.Muted)
+status.Position = UDim2.fromOffset(15, 463)
+status.Size = UDim2.fromOffset(440, 19)
 
-local tabButtons = {}
-local pageFrames = {}
-
-local function makeTab(name, iconText, y)
-	local button = new("TextButton", {
-		Position = UDim2.fromOffset(7, y), Size = UDim2.new(1, -14, 0, 40),
-		BackgroundColor3 = Color3.fromRGB(29, 32, 47), BackgroundTransparency = 1,
-		BorderSizePixel = 0, AutoButtonColor = false, Text = iconText .. "   " .. name,
-		TextColor3 = Color3.fromRGB(128, 133, 156), TextSize = 10, Font = Enum.Font.GothamBold,
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}, sidebar)
-	new("UIPadding", {PaddingLeft = UDim.new(0, 12)}, button)
-	corner(button, 9)
-	tabButtons[name] = button
-
-	local page
-	if name == "Gameplay" then
-		page = new("ScrollingFrame", {
-			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
-			Visible = false, CanvasSize = UDim2.fromOffset(0, 620), ScrollBarThickness = 3,
-			ScrollBarImageColor3 = Color3.fromRGB(103, 84, 220), ScrollingDirection = Enum.ScrollingDirection.Y,
-		}, pages)
-	else
-		page = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false}, pages)
-	end
-	pageFrames[name] = page
-end
-
-makeTab("Misc", "●", 8)
-makeTab("Gameplay", "◆", 54)
-
-local globalStatus = new("TextLabel", {
-	Position = UDim2.new(0, 10, 1, -42), Size = UDim2.new(1, -20, 0, 30),
-	BackgroundTransparency = 1, Text = "SYSTEM READY", TextColor3 = Color3.fromRGB(88, 199, 150),
-	TextSize = 8, Font = Enum.Font.GothamBold, TextWrapped = true,
-}, sidebar)
-
-local function setStatus(text, color)
-	if state.destroyed then return end
-	globalStatus.Text = text
-	globalStatus.TextColor3 = color or Color3.fromRGB(88, 199, 150)
-end
-
-local function switchTab(name)
-	state.tab = name
-	for tabName, button in tabButtons do
-		local active = tabName == name
-		pageFrames[tabName].Visible = active
-		tween(button, {
-			BackgroundTransparency = active and 0 or 1,
-			BackgroundColor3 = active and Color3.fromRGB(48, 43, 80) or Color3.fromRGB(29, 32, 47),
-			TextColor3 = active and Color3.fromRGB(234, 231, 255) or Color3.fromRGB(128, 133, 156),
-		})
+local function setStatus(message)
+	if not S.closed then
+		status.Text = message
 	end
 end
 
-for name, button in tabButtons do
-	connect(button.MouseButton1Click, function() switchTab(name) end)
-end
+local pages = {}
+local tabs = {}
 
-local function pageTitle(page, titleText, subText)
-	new("TextLabel", {
-		Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, -4, 0, 21), BackgroundTransparency = 1,
-		Text = titleText, TextColor3 = Color3.fromRGB(240, 242, 251), TextSize = 14,
-		Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+for index, name in ipairs({"Misc", "Gameplay"}) do
+	local tab = make("TextButton", {
+		Position = UDim2.fromOffset(0, (index - 1) * 43),
+		Size = UDim2.fromOffset(101, 36),
+		BackgroundColor3 = C.Card,
+		BorderSizePixel = 0,
+		Text = name,
+		TextSize = 12,
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamBold,
+	}, body)
+	round(tab, 8)
+	tabs[name] = tab
+
+	local page = make("ScrollingFrame", {
+		Name = name,
+		Position = UDim2.fromOffset(112, 0),
+		Size = UDim2.fromOffset(338, 398),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = C.Accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		Visible = index == 1,
+	}, body)
+
+	make("UIListLayout", {
+		Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
 	}, page)
-	new("TextLabel", {
-		Position = UDim2.fromOffset(2, 21), Size = UDim2.new(1, -4, 0, 16), BackgroundTransparency = 1,
-		Text = subText, TextColor3 = Color3.fromRGB(110, 115, 138), TextSize = 9,
-		Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+
+	make("UIPadding", {
+		PaddingBottom = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 8),
 	}, page)
+
+	pages[name] = page
 end
 
-local function makeToggleCard(page, y, titleText, detailText)
-	local card = new("TextButton", {
-		Position = UDim2.fromOffset(0, y), Size = UDim2.new(1, 0, 0, 57),
-		BackgroundColor3 = Color3.fromRGB(25, 28, 41), BorderSizePixel = 0,
-		AutoButtonColor = false, Text = "",
-	}, page)
-	corner(card, 11)
-	local cardStroke = stroke(card, Color3.fromRGB(60, 65, 86), 0.45)
-	local dot = new("Frame", {
-		Position = UDim2.fromOffset(13, 21), Size = UDim2.fromOffset(13, 13),
-		BackgroundColor3 = Color3.fromRGB(99, 104, 124), BorderSizePixel = 0,
-	}, card)
-	corner(dot, 20)
-	local titleLabel = new("TextLabel", {
-		Position = UDim2.fromOffset(37, 10), Size = UDim2.new(1, -94, 0, 19), BackgroundTransparency = 1,
-		Text = titleText, TextColor3 = Color3.fromRGB(214, 217, 231), TextSize = 11,
-		Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-	}, card)
-	new("TextLabel", {
-		Position = UDim2.fromOffset(37, 29), Size = UDim2.new(1, -94, 0, 16), BackgroundTransparency = 1,
-		Text = detailText, TextColor3 = Color3.fromRGB(111, 116, 139), TextSize = 8,
-		Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
-	}, card)
-	local track = new("Frame", {
-		Position = UDim2.new(1, -51, 0.5, -10), Size = UDim2.fromOffset(38, 20),
-		BackgroundColor3 = Color3.fromRGB(52, 56, 73), BorderSizePixel = 0,
-	}, card)
-	corner(track, 20)
-	local knob = new("Frame", {
-		Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(14, 14),
-		BackgroundColor3 = Color3.fromRGB(217, 220, 233), BorderSizePixel = 0,
-	}, track)
-	corner(knob, 20)
-
-	local function render(on)
-		tween(card, {BackgroundColor3 = on and Color3.fromRGB(26, 45, 43) or Color3.fromRGB(25, 28, 41)})
-		tween(cardStroke, {Color = on and Color3.fromRGB(66, 220, 155) or Color3.fromRGB(60, 65, 86)})
-		tween(dot, {BackgroundColor3 = on and Color3.fromRGB(70, 239, 157) or Color3.fromRGB(99, 104, 124)})
-		tween(track, {BackgroundColor3 = on and Color3.fromRGB(73, 202, 141) or Color3.fromRGB(52, 56, 73)})
-		tween(knob, {Position = on and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)})
-		titleLabel.TextColor3 = on and Color3.fromRGB(235, 255, 246) or Color3.fromRGB(214, 217, 231)
-	end
-
-	return card, render
-end
-
--- Misc page ------------------------------------------------------------------
-
-local miscPage = pageFrames.Misc
-pageTitle(miscPage, "Miscellaneous", "Lightweight quality-of-life automation")
-local babyCard, renderBaby = makeToggleCard(miscPage, 48, "AUTO BABY", "Instantly activates the pickup prompt")
-
-connect(babyCard.MouseButton1Click, function()
-	state.autoBaby = not state.autoBaby
-	renderBaby(state.autoBaby)
-	setStatus(state.autoBaby and "AUTO BABY ARMED" or "AUTO BABY DISABLED")
-	if state.autoBaby then
-		local baby = Workspace:FindFirstChild(CONFIG.BabyName)
-		if baby and activateBaby then task.defer(activateBaby, baby) end
-	end
-end)
-
--- Gameplay page --------------------------------------------------------------
-
-local gameplayPage = pageFrames.Gameplay
-pageTitle(gameplayPage, "Gameplay", "Honeycomb selection and completion")
-
-new("TextLabel", {
-	Position = UDim2.fromOffset(2, 43), Size = UDim2.new(1, -4, 0, 15), BackgroundTransparency = 1,
-	Text = "PREFERRED SHAPE", TextColor3 = Color3.fromRGB(131, 136, 160), TextSize = 8,
-	Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-}, gameplayPage)
-
-local shapeHolder = new("Frame", {
-	Position = UDim2.fromOffset(0, 61), Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1,
-}, gameplayPage)
-new("UIListLayout", {
-	FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5),
-	HorizontalAlignment = Enum.HorizontalAlignment.Left,
-}, shapeHolder)
-
-local shapeButtons = {}
-local function renderShapes()
-	for name, button in shapeButtons do
-		local active = name == state.selectedShape
-		tween(button, {
-			BackgroundColor3 = active and Color3.fromRGB(102, 79, 230) or Color3.fromRGB(28, 31, 45),
-			TextColor3 = active and Color3.new(1, 1, 1) or Color3.fromRGB(145, 150, 172),
-		})
+local function switchPage(name)
+	for key, page in pairs(pages) do
+		page.Visible = key == name
+		tabs[key].BackgroundColor3 = key == name and C.Accent or C.Card
 	end
 end
 
-for _, shape in SHAPES do
-	local button = new("TextButton", {
-		Size = UDim2.fromOffset(60, 30), BackgroundColor3 = Color3.fromRGB(28, 31, 45),
-		BorderSizePixel = 0, AutoButtonColor = false, Text = shape:sub(1, 3):upper(),
-		TextColor3 = Color3.fromRGB(145, 150, 172), TextSize = 8, Font = Enum.Font.GothamBold,
-	}, shapeHolder)
-	corner(button, 8)
-	shapeButtons[shape] = button
-	connect(button.MouseButton1Click, function()
-		state.selectedShape = shape
-		state.lastMovedShapeInstance = nil
-		renderShapes()
-		setStatus("TARGET: " .. shape:upper())
+for name, tab in pairs(tabs) do
+	connect(tab.Activated, function()
+		switchPage(name)
 	end)
 end
 
-local moveCard, renderMove = makeToggleCard(gameplayPage, 103, "PREFERRED DOOR  •  PAUSED", "Selector saved while detection is investigated")
-local carveCard, renderCarve = makeToggleCard(gameplayPage, 169, "AUTO CARVE", "Rapidly clear every visible Path part")
+local order = 0
 
-new("Frame", {
-	Position = UDim2.fromOffset(0, 239), Size = UDim2.new(1, 0, 0, 1),
-	BackgroundColor3 = Color3.fromRGB(54, 59, 79), BackgroundTransparency = 0.35, BorderSizePixel = 0,
-}, gameplayPage)
-new("TextLabel", {
-	Position = UDim2.fromOffset(2, 251), Size = UDim2.new(1, -4, 0, 18), BackgroundTransparency = 1,
-	Text = "SABOTAGE", TextColor3 = Color3.fromRGB(237, 117, 151), TextSize = 9,
-	Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-}, gameplayPage)
+local function row(parent, height, color)
+	order += 1
+	local frame = make("Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = color or C.Card,
+		BorderSizePixel = 0,
+		LayoutOrder = order,
+	}, parent)
+	round(frame, 9)
+	return frame
+end
 
-local targetBox = new("TextBox", {
-	Position = UDim2.fromOffset(0, 274), Size = UDim2.new(1, 0, 0, 36),
-	BackgroundColor3 = Color3.fromRGB(25, 28, 41), BorderSizePixel = 0,
-	PlaceholderText = "Search players...", PlaceholderColor3 = Color3.fromRGB(104, 109, 131),
-	Text = "", TextColor3 = Color3.fromRGB(228, 231, 243), TextSize = 10,
-	Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
-}, gameplayPage)
-corner(targetBox, 9)
-stroke(targetBox, Color3.fromRGB(65, 70, 92), 0.4)
-new("UIPadding", {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 38)}, targetBox)
+local function section(parent, titleText)
+	local frame = row(parent, 27, C.Background)
+	local label = text(frame, titleText, 12, C.Accent)
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+end
 
-local selectedHeadshot = new("ImageLabel", {
-	Position = UDim2.new(1, -31, 0, 278), Size = UDim2.fromOffset(27, 27),
-	BackgroundColor3 = Color3.fromRGB(41, 44, 59), BorderSizePixel = 0,
-	Image = "", ZIndex = 4,
-}, gameplayPage)
-corner(selectedHeadshot, 20)
+local function note(parent, value)
+	local frame = row(parent, 30, C.Background)
+	local label = text(frame, value, 10, C.Muted)
+	label.Size = UDim2.fromScale(1, 1)
+	label.TextWrapped = true
+	return label
+end
 
-local targetResults = new("ScrollingFrame", {
-	Position = UDim2.fromOffset(0, 313), Size = UDim2.new(1, 0, 0, 130),
-	BackgroundColor3 = Color3.fromRGB(18, 20, 30), BorderSizePixel = 0,
-	CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	ScrollBarThickness = 3, ScrollBarImageColor3 = Color3.fromRGB(112, 89, 235),
-	Visible = false, ZIndex = 20,
-}, gameplayPage)
-corner(targetResults, 10)
-stroke(targetResults, Color3.fromRGB(80, 73, 119), 0.25)
-local targetLayout = new("UIListLayout", {
-	Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
-}, targetResults)
-new("UIPadding", {
-	PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
-	PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5),
-}, targetResults)
+local function addButton(parent, value, callback)
+	order += 1
+	local button = make("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = C.Card,
+		BorderSizePixel = 0,
+		Text = value,
+		TextColor3 = C.Text,
+		TextSize = 11,
+		Font = Enum.Font.GothamBold,
+		LayoutOrder = order,
+	}, parent)
+	round(button, 8)
+	connect(button.Activated, callback)
+	return button
+end
 
-local selectedTargetLabel = new("TextLabel", {
-	Position = UDim2.fromOffset(2, 316), Size = UDim2.new(1, -4, 0, 20), BackgroundTransparency = 1,
-	Text = "NO TARGET SELECTED", TextColor3 = Color3.fromRGB(116, 121, 143), TextSize = 8,
-	Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
-}, gameplayPage)
+local function addToggle(parent, titleText, description, callback)
+	local frame = row(parent, 59)
+	local button = make("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, frame)
 
-local barrierCard, renderBarrier = makeToggleCard(gameplayPage, 342, "REMOVE BARRIERS", "Hide the target's Walls and Offlimits")
-local lockCard, renderLock = makeToggleCard(gameplayPage, 408, "COOKIE LOCK", "Lay flat and remain locked over Main")
-local breakCard, renderBreak = makeToggleCard(gameplayPage, 474, "BREAK COOKIE", "Continuously click the target's Main")
+	local heading = text(frame, titleText, 11)
+	heading.Position = UDim2.fromOffset(12, 8)
+	heading.Size = UDim2.new(1, -65, 0, 20)
+	heading.Font = Enum.Font.GothamBold
 
-local refreshTargetResults
-local setSelectedTarget
-local applyBarrierState
-local releaseCookieLock
-local startBreakLoop
-local removedBarriers = {}
-local lockedHumanoid = nil
-local barrierMutating = false
-local suppressTargetRefresh = false
+	local detail = text(frame, description, 9, C.Muted)
+	detail.Position = UDim2.fromOffset(12, 32)
+	detail.Size = UDim2.new(1, -20, 0, 16)
 
--- World helpers --------------------------------------------------------------
+	local indicator = text(frame, "OFF", 10)
+	indicator.Position = UDim2.new(1, -43, 0, 10)
+	indicator.Size = UDim2.fromOffset(36, 20)
 
-local function follow(root, names)
-	local current = root
-	for _, name in names do
-		current = current and current:FindFirstChild(name)
+	local value = false
+	local api = {}
+
+	function api.Set(enabled)
+		value = enabled
+		frame.BackgroundColor3 = enabled and C.Enabled or C.Card
+		indicator.Text = enabled and "ON" or "OFF"
 	end
-	return current
+
+	connect(button.Activated, function()
+		local result = callback(not value)
+		if typeof(result) == "boolean" then
+			api.Set(result)
+		else
+			api.Set(not value)
+		end
+	end)
+
+	return api
 end
 
-local function honeycombRoot()
-	return follow(Workspace, CONFIG.HoneycombPath)
+local function addSlider(parent, titleText, minimum, maximum, initial, callback)
+	local frame = row(parent, 63)
+	local caption = text(frame, "", 11)
+	caption.Position = UDim2.fromOffset(12, 6)
+	caption.Size = UDim2.new(1, -24, 0, 20)
+
+	local track = make("TextButton", {
+		Position = UDim2.fromOffset(12, 35),
+		Size = UDim2.new(1, -24, 0, 17),
+		BackgroundColor3 = Color3.fromRGB(53, 58, 80),
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+	}, frame)
+	round(track, 9)
+
+	local fill = make("Frame", {
+		BackgroundColor3 = C.Accent,
+		BorderSizePixel = 0,
+		Size = UDim2.fromScale(0, 1),
+	}, track)
+	round(fill, 9)
+
+	local value = initial
+	local dragging = false
+	local touch
+	local api = {}
+
+	local function paint()
+		local span = maximum - minimum
+		fill.Size = UDim2.fromScale(
+			span > 0 and (value - minimum) / span or 0, 1
+		)
+		caption.Text = titleText .. "  •  " .. value
+	end
+
+	local function move(x)
+		if track.AbsoluteSize.X <= 0 then return end
+		local fraction = math.clamp(
+			(x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1
+		)
+		value = math.clamp(
+			math.floor(minimum + fraction * (maximum - minimum) + 0.5),
+			minimum, maximum
+		)
+		paint()
+		callback(value)
+	end
+
+	function api.SetMaximum(newMaximum)
+		maximum = math.max(minimum, math.floor(newMaximum))
+		value = math.clamp(value, minimum, maximum)
+		paint()
+		return value
+	end
+
+	connect(track.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			touch = input.UserInputType == Enum.UserInputType.Touch and input or nil
+			move(input.Position.X)
+		end
+	end)
+
+	connect(UIS.InputChanged, function(input)
+		if dragging and (
+			(touch and input == touch)
+			or (not touch and input.UserInputType == Enum.UserInputType.MouseMovement)
+		) then
+			move(input.Position.X)
+		end
+	end)
+
+	connect(UIS.InputEnded, function(input)
+		if input == touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+			touch = nil
+		end
+	end)
+
+	paint()
+	return api
 end
 
-local function targetShapeModel(target)
-	if not target then return nil end
-	local honeycomb = honeycombRoot()
-	local shapes = honeycomb and honeycomb:FindFirstChild("Shapes")
-	return shapes and shapes:FindFirstChild(target.Name) or nil
+--==================================================
+-- MOUSE INPUT
+--==================================================
+
+local function releaseMouse()
+	if mouseHeld then
+		mouseHeld = false
+		if VIM then
+			pcall(function()
+				VIM:SendMouseButtonEvent(mouseX, mouseY, 0, false, game, 0)
+			end)
+		end
+	end
 end
 
-local function targetMain(target)
-	local model = targetShapeModel(target)
-	local mainPart = model and model:FindFirstChild("Main", true)
-	return mainPart and mainPart:IsA("BasePart") and mainPart or nil
+local function projectedTarget(part)
+	local camera = Workspace.CurrentCamera
+	if not camera or not part:IsDescendantOf(Workspace) then
+		return nil
+	end
+
+	local point, visible = camera:WorldToViewportPoint(part.Position)
+	if not visible or point.Z <= 0 then
+		return nil
+	end
+
+	local x, y = math.floor(point.X), math.floor(point.Y)
+
+	for _, object in ipairs(playerGui:GetGuiObjectsAtPosition(x, y)) do
+		if object:IsDescendantOf(gui) then
+			return nil
+		end
+	end
+
+	local parameters = RaycastParams.new()
+	parameters.FilterType = Enum.RaycastFilterType.Exclude
+	parameters.FilterDescendantsInstances = player.Character and {player.Character} or {}
+
+	local ray = camera:ViewportPointToRay(x, y)
+	local hit = Workspace:Raycast(
+		ray.Origin, ray.Direction * (point.Z + 100), parameters
+	)
+
+	if not hit or hit.Instance ~= part then
+		return nil
+	end
+
+	return x, y
+end
+
+local function clickPart(part, active)
+	if clickBusy or not active() or not part.Parent then
+		return false
+	end
+
+	clickBusy = true
+
+	local ok, result = pcall(function()
+		local detector = part:FindFirstChildWhichIsA("ClickDetector", true)
+
+		if detector and typeof(fireclickdetector) == "function" then
+			fireclickdetector(detector)
+			task.wait(CONFIG.CarveClickTime)
+			return true
+		end
+
+		if not VIM then
+			return false
+		end
+
+		local x, y = projectedTarget(part)
+		if not x then
+			return false
+		end
+
+		VIM:SendMouseMoveEvent(x, y, game)
+		RunService.RenderStepped:Wait()
+
+		if not active() or not part.Parent then
+			return false
+		end
+
+		local newX, newY = projectedTarget(part)
+		if not newX or math.abs(newX - x) > 1 or math.abs(newY - y) > 1 then
+			return false
+		end
+
+		mouseX, mouseY = newX, newY
+		mouseHeld = true
+
+		VIM:SendMouseButtonEvent(mouseX, mouseY, 0, true, game, 0)
+		task.wait(CONFIG.CarveClickTime)
+		releaseMouse()
+
+		return true
+	end)
+
+	releaseMouse()
+	clickBusy = false
+
+	if not ok then
+		setStatus("Click input failed: " .. tostring(result))
+		return false
+	end
+
+	return result == true
+end
+
+--==================================================
+-- RESTORABLE LOCAL CHANGES
+--==================================================
+
+local function restorePrompts()
+	for prompt, original in pairs(promptOriginals) do
+		pcall(function()
+			prompt.MaxActivationDistance = original.Distance
+			prompt.HoldDuration = original.Hold
+			prompt.RequiresLineOfSight = original.Sight
+		end)
+	end
+	table.clear(promptOriginals)
+end
+
+local function restoreHitbox(part)
+	local original = hitboxOriginals[part]
+	if not original then return end
+
+	pcall(function()
+		part.Size = original.Size
+		part.Transparency = original.Transparency
+		part.CanCollide = original.CanCollide
+		part.Massless = original.Massless
+	end)
+
+	hitboxOriginals[part] = nil
+end
+
+local function restoreHitboxes()
+	local parts = {}
+	for part in pairs(hitboxOriginals) do
+		table.insert(parts, part)
+	end
+	for _, part in ipairs(parts) do
+		restoreHitbox(part)
+	end
 end
 
 local function restoreBarriers()
-	barrierMutating = true
-	for index = #removedBarriers, 1, -1 do
-		local record = removedBarriers[index]
-		if record.instance and record.parent and record.parent.Parent then
-			record.instance.Parent = record.parent
-		end
-		table.remove(removedBarriers, index)
+	for object, parent in pairs(detached) do
+		pcall(function()
+			if object.Parent == nil and parent.Parent then
+				object.Parent = parent
+			end
+		end)
 	end
-	barrierMutating = false
+	table.clear(detached)
 end
 
-applyBarrierState = function()
-	restoreBarriers()
-	if not state.barriersRemoved or not state.selectedTarget then return end
-	local model = targetShapeModel(state.selectedTarget)
-	if not model then
-		setStatus("SABOTAGE • TARGET COOKIE MISSING", Color3.fromRGB(242, 175, 85))
-		return
-	end
-	for _, name in {"Walls", "Offlimits"} do
+local function applyBarriers()
+	if not S.barriers or not eligible(S.target) then return end
+
+	local model = cookie(S.target)
+	if not model then return end
+
+	for _, name in ipairs({"Walls", "Offlimits"}) do
 		local object = model:FindFirstChild(name, true)
-		if object then
-			table.insert(removedBarriers, {instance = object, parent = object.Parent})
+		if object and not detached[object] then
+			detached[object] = object.Parent
 			object.Parent = nil
 		end
 	end
-	setStatus("SABOTAGE • BARRIERS REMOVED", Color3.fromRGB(237, 117, 151))
 end
 
-releaseCookieLock = function()
-	if lockedHumanoid and lockedHumanoid.Parent then
-		lockedHumanoid.PlatformStand = false
-		lockedHumanoid.AutoRotate = true
+local function releaseLock()
+	local snapshot = lockSnapshot
+	lockSnapshot = nil
+	if not snapshot then return end
+
+	pcall(function()
+		if snapshot.Humanoid.Parent then
+			snapshot.Humanoid.PlatformStand = snapshot.PlatformStand
+			snapshot.Humanoid.AutoRotate = snapshot.AutoRotate
+		end
+
+		if snapshot.Root.Parent then
+			local root = snapshot.Root
+			root.CFrame = CFrame.lookAt(root.Position, root.Position + snapshot.Facing)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
+	end)
+end
+
+local function stopSabotage()
+	S.lock = false
+	S.breaking = false
+	if widgets.lock then widgets.lock.Set(false) end
+	if widgets.breaking then widgets.breaking.Set(false) end
+	releaseLock()
+	releaseMouse()
+end
+
+local walkBinding = "BunduAdmin_RLGL_AutoWalk"
+
+local function stopWalk(message)
+	S.walk = false
+	RunService:UnbindFromRenderStep(walkBinding)
+
+	if walkingHumanoid and walkingHumanoid.Parent then
+		walkingHumanoid:Move(Vector3.zero, false)
 	end
-	lockedHumanoid = nil
+
+	walkingHumanoid = nil
+	if widgets.walk then widgets.walk.Set(false) end
+	if message then setStatus(message) end
 end
 
-local function updateCookieLock()
-	if not state.cookieLock then return end
-	local mainPart = targetMain(state.selectedTarget)
-	local character = player.Character
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if not mainPart or not root or not humanoid then return end
-	lockedHumanoid = humanoid
-	humanoid.AutoRotate = false
-	humanoid.PlatformStand = true
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
-	local position = mainPart.Position + Vector3.new(0, CONFIG.CookieLockHeight, 0)
-	local flatFacing = Vector3.new(mainPart.CFrame.LookVector.X, 0, mainPart.CFrame.LookVector.Z)
-	if flatFacing.Magnitude < 0.01 then flatFacing = Vector3.new(0, 0, -1) end
-	root.CFrame = CFrame.lookAt(position, position + flatFacing.Unit) * CFrame.Angles(0, 0, math.rad(90))
+local function pauseActions()
+	stopWalk()
+	S.carve = false
+	S.carveToken += 1
+	if widgets.carve then widgets.carve.Set(false) end
+	stopSabotage()
+
+	local _, humanoid = characterParts()
+	if humanoid then
+		humanoid:Move(Vector3.zero, false)
+	end
 end
 
-local function findShapeUnder(door, wanted)
-	local object = door:FindFirstChild(wanted, true)
-	return object
+--==================================================
+-- MISC: AUTO BABY
+--==================================================
+
+local lastBabyFire = 0
+
+local function tryBaby()
+	if S.closed or not S.baby or player:GetAttribute("IsGuard") then
+		return
+	end
+
+	local baby = Workspace:FindFirstChild("BabyPickup")
+	local prompt = baby and baby:FindFirstChild("PickupPrompt", true)
+
+	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then
+		return
+	end
+
+	if typeof(fireproximityprompt) ~= "function" then
+		setStatus("Auto Baby: fireproximityprompt is unavailable")
+		return
+	end
+
+	if os.clock() - lastBabyFire < 0.2 then return end
+	lastBabyFire = os.clock()
+
+	if not promptOriginals[prompt] then
+		promptOriginals[prompt] = {
+			Distance = prompt.MaxActivationDistance,
+			Hold = prompt.HoldDuration,
+			Sight = prompt.RequiresLineOfSight,
+		}
+	end
+
+	local ok, err = pcall(function()
+		prompt.MaxActivationDistance = 100000
+		prompt.HoldDuration = 0
+		prompt.RequiresLineOfSight = false
+		fireproximityprompt(prompt)
+	end)
+
+	if not ok then
+		setStatus("Auto Baby: " .. tostring(err))
+	end
 end
 
-local function worldPosition(object)
+section(pages.Misc, "MISC")
+
+widgets.baby = addToggle(
+	pages.Misc, "AUTO BABY", "Attempts pickup when BabyPickup appears",
+	function(enabled)
+		S.baby = enabled
+		if enabled then
+			task.defer(tryBaby)
+		else
+			restorePrompts()
+		end
+		return enabled
+	end
+)
+
+--==================================================
+-- MISC: HITBOXES
+--==================================================
+
+local function updateHitboxes()
+	if not S.hitboxes then return end
+
+	local current = {}
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player then
+			local character = other.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+
+			if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+				current[root] = true
+
+				if not hitboxOriginals[root] then
+					hitboxOriginals[root] = {
+						Size = root.Size,
+						Transparency = root.Transparency,
+						CanCollide = root.CanCollide,
+						Massless = root.Massless,
+					}
+				end
+
+				root.Size = Vector3.new(S.hitboxSize, S.hitboxSize, S.hitboxSize)
+				root.Transparency = 0.85
+				root.CanCollide = false
+				root.Massless = true
+			end
+		end
+	end
+
+	local stale = {}
+	for part in pairs(hitboxOriginals) do
+		if not current[part] then table.insert(stale, part) end
+	end
+	for _, part in ipairs(stale) do restoreHitbox(part) end
+end
+
+widgets.hitboxes = addToggle(
+	pages.Misc, "HITBOX EXPANDER", "Local root size • original properties restored on OFF",
+	function(enabled)
+		S.hitboxes = enabled
+		if enabled then updateHitboxes() else restoreHitboxes() end
+		return enabled
+	end
+)
+
+addSlider(pages.Misc, "Hitbox size / studs", 1, 100, S.hitboxSize, function(value)
+	S.hitboxSize = value
+	updateHitboxes()
+end)
+
+--==================================================
+-- MISC: LOW-HEALTH ESCAPE / RETURN
+--==================================================
+
+section(pages.Misc, "SAFE TELEPORT")
+
+local escapeInfo
+local returnButton
+local thresholdSlider
+
+local function refreshReturn()
+	local valid = savedReturn and savedReturn.Character == player.Character
+	returnButton.Text = valid and "RETURN TO SAVED POSITION" or "RETURN • NO SAVED POSITION"
+	returnButton.TextTransparency = valid and 0 or 0.5
+end
+
+local function safeDestination(character, humanoid, root, platform)
+	local cf, size = platform.CFrame, platform.Size
+	local top = (
+		math.abs(cf.RightVector.Y) * size.X
+		+ math.abs(cf.UpVector.Y) * size.Y
+		+ math.abs(cf.LookVector.Y) * size.Z
+	) / 2
+
+	local clearance = humanoid.HipHeight + root.Size.Y / 2 + 0.75
+	if humanoid.RigType == Enum.HumanoidRigType.R6 then
+		local leg = character:FindFirstChild("Left Leg")
+		clearance += leg and leg.Size.Y or 2
+	end
+
+	local position = platform.Position + Vector3.new(0, top + clearance, 0)
+	local look = root.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.001 then flat = Vector3.new(0, 0, -1) end
+
+	local destinationRoot = CFrame.lookAt(position, position + flat.Unit)
+	return destinationRoot * root.CFrame:ToObjectSpace(character:GetPivot())
+end
+
+checkHealth = function()
+	if S.closed or not S.escape or escapeBusy then return end
+
+	local character, humanoid, root = characterParts()
+	if not humanoid or not root then return end
+
+	if humanoid.Health <= 0 then
+		escapeInfo.Text = "Cannot escape after death"
+		return
+	end
+
+	if humanoid.Health > S.threshold then
+		S.armed = true
+		escapeInfo.Text = "Armed • escape at " .. S.threshold .. " HP"
+		return
+	end
+
+	if not S.armed then
+		escapeInfo.Text = "Paused • heal above threshold or toggle off/on"
+		return
+	end
+
+	local platform = findPath(Workspace, "Data", "CharacterEditor", "Platform")
+	if not platform or not platform:IsA("BasePart") then
+		escapeInfo.Text = "Waiting for safe platform"
+		return
+	end
+
+	escapeBusy = true
+	local previous = character:GetPivot()
+
+	local ok, err = pcall(function()
+		pauseActions()
+		character:PivotTo(safeDestination(character, humanoid, root, platform))
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+
+	if ok then
+		savedReturn = {Character = character, Pivot = previous}
+		S.armed = false
+		escapeInfo.Text = "Teleported • Return position saved"
+		refreshReturn()
+	else
+		escapeInfo.Text = "Escape failed"
+		warn("[BunduAdmin] Escape:", err)
+	end
+
+	escapeBusy = false
+end
+
+widgets.escape = addToggle(
+	pages.Misc, "LOW-HEALTH ESCAPE", "Saves your position before moving to the platform",
+	function(enabled)
+		S.escape = enabled
+		S.armed = enabled
+		if enabled then
+			checkHealth()
+		else
+			escapeInfo.Text = "Escape OFF"
+		end
+		return enabled
+	end
+)
+
+thresholdSlider = addSlider(
+	pages.Misc, "Escape threshold / HP", 1, 100, S.threshold,
+	function(value)
+		S.threshold = value
+		checkHealth()
+	end
+)
+
+returnButton = addButton(pages.Misc, "RETURN • NO SAVED POSITION", function()
+	if escapeBusy or not savedReturn then return end
+
+	local character, humanoid, root = characterParts()
+	if character ~= savedReturn.Character or not humanoid or not root
+		or humanoid.Health <= 0 then
+		setStatus("Return unavailable for this character")
+		return
+	end
+
+	escapeBusy = true
+	local ok, err = pcall(function()
+		pauseActions()
+		character:PivotTo(savedReturn.Pivot)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+
+	if ok then
+		S.armed = S.escape and humanoid.Health > S.threshold
+		escapeInfo.Text = S.armed
+			and "Returned • escape armed"
+			or "Returned • escape waits for healing or off/on"
+	else
+		escapeInfo.Text = "Return failed"
+		warn("[BunduAdmin] Return:", err)
+	end
+
+	escapeBusy = false
+end)
+
+escapeInfo = note(pages.Misc, "Escape OFF")
+refreshReturn()
+
+--==================================================
+-- GAMEPLAY: PREFERRED SHAPE / AUTO CARVE
+--==================================================
+
+section(pages.Gameplay, "HONEYCOMB")
+
+local shapeButtons = {}
+local shapeRow = row(pages.Gameplay, 35, C.Background)
+
+make("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 4),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, shapeRow)
+
+for index, name in ipairs({"Circle", "Star", "Umbrella", "Square", "Triangle"}) do
+	local button = make("TextButton", {
+		Size = UDim2.new(0.2, -4, 1, 0),
+		BackgroundColor3 = name == S.shape and C.Accent or C.Card,
+		BorderSizePixel = 0,
+		Text = name,
+		TextSize = 9,
+		TextColor3 = C.Text,
+		Font = Enum.Font.GothamBold,
+		LayoutOrder = index,
+	}, shapeRow)
+	round(button, 7)
+	shapeButtons[name] = button
+
+	connect(button.Activated, function()
+		S.shape = name
+		for shape, control in pairs(shapeButtons) do
+			control.BackgroundColor3 = shape == name and C.Accent or C.Card
+		end
+		setStatus("Preferred shape: " .. name .. " • functionality paused")
+	end)
+end
+
+note(pages.Gameplay, "Preferred Door is paused. Selecting a shape does not teleport.")
+
+local carveInfo
+
+local function carvePath()
+	local model = cookie(player)
+	return model, model and model:FindFirstChild("Path")
+end
+
+startCarve = function()
+	if S.closed or not S.carve or S.carving then return end
+
+	local model, path = carvePath()
+	if not path then
+		carveInfo.Text = "Waiting for your cookie's Path"
+		return
+	end
+
+	S.carving = true
+	S.carveToken += 1
+	local token = S.carveToken
+	stopSabotage()
+	stopWalk()
+
+	local function active()
+		return not S.closed and S.carve and token == S.carveToken
+			and cookie(player) == model
+			and path:IsDescendantOf(Workspace)
+	end
+
+	task.spawn(function()
+		local attempts, skipped = 0, 0
+
+		local ok, err = pcall(function()
+			for pass = 1, CONFIG.CarvePasses do
+				if not active() then break end
+
+				local parts = {}
+				if path:IsA("BasePart") then table.insert(parts, path) end
+				for _, object in ipairs(path:GetDescendants()) do
+					if object:IsA("BasePart") then
+						table.insert(parts, object)
+					end
+				end
+
+				if #parts == 0 then break end
+
+				for _, part in ipairs(parts) do
+					if not active() then break end
+					if part:IsDescendantOf(path) or part == path then
+						if clickPart(part, active) then
+							attempts += 1
+						else
+							skipped += 1
+						end
+					end
+					RunService.Heartbeat:Wait()
+				end
+
+				if not S.closed then
+					carveInfo.Text = string.format(
+						"Pass %d/%d • %d attempts • %d skipped",
+						pass, CONFIG.CarvePasses, attempts, skipped
+					)
+				end
+
+				task.wait(0.08)
+			end
+		end)
+
+		releaseMouse()
+		S.carving = false
+
+		if S.closed then return end
+
+		if not ok then
+			carveInfo.Text = "Carve error • see Output"
+			warn("[BunduAdmin] Carve:", err)
+		elseif active() then
+			carveInfo.Text = string.format(
+				"%d attempts • %d skipped • use Retry if needed", attempts, skipped
+			)
+		end
+	end)
+end
+
+widgets.carve = addToggle(
+	pages.Gameplay, "AUTO CARVE", "Clicks Path parts • no character or camera movement",
+	function(enabled)
+		S.carve = enabled
+		S.carveToken += 1
+
+		if enabled then
+			startCarve()
+		else
+			releaseMouse()
+			carveInfo.Text = "Auto Carve OFF"
+		end
+		return enabled
+	end
+)
+
+addButton(pages.Gameplay, "RETRY CURRENT PATH", function()
+	if S.carving then
+		setStatus("A carving pass is already running")
+		return
+	end
+	S.carve = true
+	widgets.carve.Set(true)
+	startCarve()
+end)
+
+carveInfo = note(pages.Gameplay, "Idle • skipped parts may be obscured or off-screen")
+
+--==================================================
+-- GAMEPLAY: SABOTAGE TARGET PICKER
+--==================================================
+
+section(pages.Gameplay, "SABOTAGE")
+
+local picker = row(pages.Gameplay, 38)
+local search = make("TextBox", {
+	Position = UDim2.fromOffset(10, 3),
+	Size = UDim2.new(1, -20, 1, -6),
+	BackgroundTransparency = 1,
+	Text = "",
+	PlaceholderText = "Search Player team...",
+	PlaceholderColor3 = C.Muted,
+	TextColor3 = C.Text,
+	TextSize = 11,
+	Font = Enum.Font.GothamMedium,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false,
+}, picker)
+
+local results = row(pages.Gameplay, 145, C.Panel)
+results.Visible = false
+
+local resultList = make("ScrollingFrame", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, results)
+
+make("UIListLayout", {
+	Padding = UDim.new(0, 4),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, resultList)
+
+local selectedLabel = note(pages.Gameplay, "No player selected")
+local thumbnailCache = {}
+local resultGeneration = 0
+
+selectTarget = function(other)
+	stopSabotage()
+	restoreBarriers()
+	S.target = eligible(other) and other or nil
+
+	selectedLabel.Text = S.target
+		and (S.target.DisplayName .. "  @" .. S.target.Name)
+		or "No player selected"
+
+	if S.barriers then applyBarriers() end
+	results.Visible = false
+	search:ReleaseFocus()
+end
+
+refreshTargets = function()
+	if S.closed or not results.Visible then return end
+	resultGeneration += 1
+	local generation = resultGeneration
+
+	for _, object in ipairs(resultList:GetChildren()) do
+		if object:IsA("GuiObject") then object:Destroy() end
+	end
+
+	local query = string.lower(search.Text)
+	local matches = {}
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if eligible(other) and (
+			query == ""
+			or string.find(string.lower(other.Name), query, 1, true)
+			or string.find(string.lower(other.DisplayName), query, 1, true)
+		) then
+			table.insert(matches, other)
+		end
+	end
+
+	table.sort(matches, function(a, b)
+		return string.lower(a.Name) < string.lower(b.Name)
+	end)
+
+	for index, other in ipairs(matches) do
+		local button = make("TextButton", {
+			Size = UDim2.new(1, -5, 0, 42),
+			BackgroundColor3 = C.Card,
+			BorderSizePixel = 0,
+			Text = "",
+			LayoutOrder = index,
+		}, resultList)
+		round(button, 7)
+
+		local avatar = make("ImageLabel", {
+			Position = UDim2.fromOffset(4, 3),
+			Size = UDim2.fromOffset(36, 36),
+			BackgroundTransparency = 1,
+			Image = thumbnailCache[other.UserId] or "",
+		}, button)
+		round(avatar, 18)
+
+		local nameLabel = text(
+			button, other.DisplayName .. "  @" .. other.Name, 10
+		)
+		nameLabel.Position = UDim2.fromOffset(48, 0)
+		nameLabel.Size = UDim2.new(1, -52, 1, 0)
+
+		button.Activated:Connect(function()
+			selectTarget(other)
+		end)
+
+		if not thumbnailCache[other.UserId] then
+			task.spawn(function()
+				local ok, image = pcall(function()
+					return Players:GetUserThumbnailAsync(
+						other.UserId,
+						Enum.ThumbnailType.HeadShot,
+						Enum.ThumbnailSize.Size100x100
+					)
+				end)
+
+				if ok then
+					thumbnailCache[other.UserId] = image
+					if not S.closed and generation == resultGeneration and avatar.Parent then
+						avatar.Image = image
+					end
+				end
+			end)
+		end
+	end
+end
+
+connect(search.Focused, function()
+	results.Visible = true
+	refreshTargets()
+end)
+
+connect(search:GetPropertyChangedSignal("Text"), refreshTargets)
+
+connect(search.FocusLost, function()
+	task.delay(0.2, function()
+		if not S.closed and not search:IsFocused() then
+			results.Visible = false
+		end
+	end)
+end)
+
+widgets.barriers = addToggle(
+	pages.Gameplay, "REMOVE WALLS / LIMITS", "Local removal • restores on OFF or target change",
+	function(enabled)
+		if enabled and not eligible(S.target) then
+			setStatus("Select a player first")
+			return false
+		end
+		S.barriers = enabled
+		if enabled then applyBarriers() else restoreBarriers() end
+		return enabled
+	end
+)
+
+widgets.lock = addToggle(
+	pages.Gameplay, "LOCK OVER COOKIE", "Lies over the selected Main • OFF releases you",
+	function(enabled)
+		if enabled and (not eligible(S.target) or not targetMain()) then
+			setStatus("Selected cookie is unavailable")
+			return false
+		end
+		if enabled and (S.carve or S.carving) then
+			setStatus("Turn Auto Carve off first")
+			return false
+		end
+
+		S.lock = enabled
+		if enabled then stopWalk() else releaseLock() end
+		return enabled
+	end
+)
+
+widgets.breaking = addToggle(
+	pages.Gameplay, "CLICK SELECTED COOKIE", "Repeated Main clicks • game decides the result",
+	function(enabled)
+		if enabled and (not eligible(S.target) or not targetMain()) then
+			setStatus("Selected cookie is unavailable")
+			return false
+		end
+		if enabled and (S.carve or S.carving) then
+			setStatus("Turn Auto Carve off first")
+			return false
+		end
+
+		S.breaking = enabled
+		if not enabled then releaseMouse() end
+		return enabled
+	end
+)
+
+--==================================================
+-- GAMEPLAY: RLGL
+--==================================================
+
+section(pages.Gameplay, "RED LIGHT GREEN LIGHT")
+local walkInfo
+local GREEN = Color3.fromRGB(85, 255, 0)
+
+local function greenLight(light)
+	if not light or not light:IsA("PointLight") or not light.Enabled then
+		return false
+	end
+
+	local color = light.Color
+	local tolerance = 0.5 / 255
+	return math.abs(color.R - GREEN.R) <= tolerance
+		and math.abs(color.G - GREEN.G) <= tolerance
+		and math.abs(color.B - GREEN.B) <= tolerance
+end
+
+local function objectPosition(object)
+	if not object then return nil end
 	if object:IsA("BasePart") then return object.Position end
 	if object:IsA("Model") then return object:GetPivot().Position end
 	local part = object:FindFirstChildWhichIsA("BasePart", true)
-	return part and part.Position or nil
+	return part and part.Position
 end
 
-local function moveToDoor(door, shapeInstance)
-	if shapeInstance == state.lastMovedShapeInstance then return end
-	local character = player.Character
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	local shapePosition = worldPosition(shapeInstance)
-	if not root or not shapePosition then
-		setStatus("DOOR FOUND • POSITION UNKNOWN", Color3.fromRGB(242, 175, 85))
+local function updateWalk()
+	if S.closed or not S.walk then return end
+
+	local _, humanoid, root = characterParts()
+	if not humanoid or not root or humanoid.Health <= 0 then
+		stopWalk()
+		walkInfo.Text = "Stopped • character unavailable"
 		return
 	end
-	local offset = CONFIG.ShapeStandingOffset
-	local destination = Vector3.new(
-		shapePosition.X + offset.X,
-		root.Position.Y,
-		shapePosition.Z + offset.Z
+
+	walkingHumanoid = humanoid
+
+	local function pause(message)
+		humanoid:Move(Vector3.zero, false)
+		if walkInfo.Text ~= message then walkInfo.Text = message end
+	end
+
+	if S.lock or S.carving then
+		pause("Paused • another action is active")
+		return
+	end
+
+	local arena = findPath(Workspace, "Map", "RedLightGreenLight", "Map")
+	local destination = objectPosition(arena and arena:FindFirstChild("Girl"))
+	local light = findPath(arena, "PointLight", "PointLight")
+
+	if not destination then
+		pause("Waiting for RLGL map")
+		return
+	end
+
+	local delta = destination - root.Position
+	local horizontal = Vector3.new(delta.X, 0, delta.Z)
+
+	if horizontal.Magnitude <= CONFIG.ArrivalDistance then
+		stopWalk()
+		walkInfo.Text = "Arrived • Auto Walk OFF"
+		return
+	end
+
+	if not greenLight(light) then
+		pause("Stopped • light is not green")
+		return
+	end
+
+	if player:GetAttribute("DISABLE_MOVEMENT")
+		or player:GetAttribute("CarryStatus") then
+		pause("Paused • movement unavailable")
+		return
+	end
+
+	humanoid:Move(horizontal.Unit, false)
+	walkInfo.Text = "Green • walking"
+end
+
+widgets.walk = addToggle(
+	pages.Gameplay, "RLGL AUTO WALK", "Green only • automatically turns off near Girl",
+	function(enabled)
+		if enabled then
+			S.walk = true
+			RunService:BindToRenderStep(
+				walkBinding,
+				Enum.RenderPriority.Character.Value + 2,
+				updateWalk
+			)
+		else
+			stopWalk()
+			walkInfo.Text = "Auto Walk OFF"
+		end
+		return enabled
+	end
+)
+
+walkInfo = note(pages.Gameplay, "Idle • follows the light visible on your client")
+
+--==================================================
+-- CHARACTER / WORLD MAINTENANCE
+--==================================================
+
+local function trackCharacter()
+	local character, humanoid = characterParts()
+
+	if character ~= trackedCharacter then
+		trackedCharacter = character
+		savedReturn = nil
+		refreshReturn()
+		S.armed = S.escape
+		stopWalk()
+		stopSabotage()
+		S.carveToken += 1
+	end
+
+	if humanoid == trackedHumanoid then return end
+
+	disconnectAll(healthConnections)
+	trackedHumanoid = humanoid
+
+	if not humanoid then return end
+
+	local function updateMaximum()
+		S.threshold = thresholdSlider.SetMaximum(humanoid.MaxHealth)
+		checkHealth()
+	end
+
+	table.insert(healthConnections, humanoid.HealthChanged:Connect(checkHealth))
+	table.insert(healthConnections,
+		humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(updateMaximum)
 	)
-	state.lastMovedShapeInstance = shapeInstance
-	root.CFrame = CFrame.lookAt(
-		destination,
-		Vector3.new(shapePosition.X, destination.Y, shapePosition.Z)
-	)
-	setStatus(state.selectedShape:upper() .. " • " .. door.Name:upper(), Color3.fromRGB(74, 231, 157))
+
+	updateMaximum()
 end
 
-local function scanPreferredDoor()
-	if state.destroyed or not state.honeycombEnabled then return end
-	local honeycomb = honeycombRoot()
-	local doors = honeycomb and honeycomb:FindFirstChild("Doors")
-	if not doors then
-		setStatus("HONEYCOMB SCANNER WAITING", Color3.fromRGB(235, 177, 89))
-		return
-	end
-	for _, door in doors:GetChildren() do
-		local shapeInstance = findShapeUnder(door, state.selectedShape)
-		if shapeInstance then
-			moveToDoor(door, shapeInstance)
-			return
-		end
-	end
-	setStatus("SCANNING FOR " .. state.selectedShape:upper(), Color3.fromRGB(116, 168, 255))
-end
+local lastPath
+local maintenanceTime = 0
+local nextBreak = 0
 
-local function queueScan()
-	if state.scanQueued or state.destroyed then return end
-	state.scanQueued = true
-	task.defer(function()
-		state.scanQueued = false
-		scanPreferredDoor()
-	end)
-end
+connect(RunService.Heartbeat, function(dt)
+	if S.closed then return end
 
-local function findLocalPath()
-	local honeycomb = honeycombRoot()
-	local shapes = honeycomb and honeycomb:FindFirstChild("Shapes")
-	local model = shapes and shapes:FindFirstChild(player.Name)
-	local path = model and model:FindFirstChild("Path")
-	local mask = model and model:FindFirstChild("_path")
-	return model, path, mask
-end
+	if S.lock then
+		local main = targetMain()
+		local _, humanoid, root = characterParts()
 
-local function mouseMove(x, y)
-	VirtualInputManager:SendMouseMoveEvent(x, y, game)
-end
+		if not eligible(S.target) or not main or not humanoid
+			or humanoid.Health <= 0 or not root then
+			stopSabotage()
+		else
+			if not lockSnapshot or lockSnapshot.Root ~= root then
+				releaseLock()
 
-local function mouseButton(x, y, down)
-	VirtualInputManager:SendMouseButtonEvent(x, y, 0, down, game, 0)
-end
+				local look = root.CFrame.LookVector
+				local facing = Vector3.new(look.X, 0, look.Z)
+				if facing.Magnitude < 0.001 then facing = Vector3.new(0, 0, -1) end
 
-local function waitForStableCamera()
-	local stable = 0
-	local previous
-	local deadline = os.clock() + 2
-	while state.autoCarve and os.clock() < deadline do
-		RunService.RenderStepped:Wait()
-		local camera = Workspace.CurrentCamera
-		local current = camera and camera.CFrame
-		if current and previous then
-			local positionDelta = (current.Position - previous.Position).Magnitude
-			local directionMatch = current.LookVector:Dot(previous.LookVector)
-			if positionDelta < 0.015 and directionMatch > 0.9999 then
-				stable += 1
-				if stable >= CONFIG.CameraStableFrames then return true end
-			else
-				stable = 0
+				lockSnapshot = {
+					Root = root,
+					Humanoid = humanoid,
+					PlatformStand = humanoid.PlatformStand,
+					AutoRotate = humanoid.AutoRotate,
+					Facing = facing.Unit,
+				}
 			end
+
+			local cf, size = main.CFrame, main.Size
+			local halfHeight = (
+				math.abs(cf.RightVector.Y) * size.X
+				+ math.abs(cf.UpVector.Y) * size.Y
+				+ math.abs(cf.LookVector.Y) * size.Z
+			) / 2
+
+			humanoid.PlatformStand = true
+			humanoid.AutoRotate = false
+
+			local position = main.Position
+				+ Vector3.new(0, halfHeight + root.Size.Z / 2 + 0.45, 0)
+
+			root.CFrame = CFrame.new(position) * CFrame.Angles(math.rad(90), 0, 0)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
 		end
-		previous = current
 	end
-	return false
-end
 
-local function collectVisiblePathPoints(path, camera)
-	local points = {}
-	if path:IsA("BasePart") then
-		local screen, visible = camera:WorldToViewportPoint(path.Position)
-		if visible and screen.Z > 0 then table.insert(points, Vector2.new(screen.X, screen.Y)) end
-	end
-	for _, object in path:GetDescendants() do
-		if object:IsA("BasePart") then
-			local screen, visible = camera:WorldToViewportPoint(object.Position)
-			if visible and screen.Z > 0 then
-				table.insert(points, Vector2.new(screen.X, screen.Y))
-			end
-		end
-	end
-	return points
-end
+	if S.breaking and not clickBusy and not S.carving and os.clock() >= nextBreak then
+		nextBreak = os.clock() + CONFIG.BreakInterval
+		local selected = S.target
+		local main = targetMain()
 
-local function orderNearest(points)
-	if #points < 2 then return points end
-	local remaining = table.clone(points)
-	local startIndex = 1
-	for index = 2, #remaining do
-		if remaining[index].X < remaining[startIndex].X then startIndex = index end
-	end
-	local ordered = {table.remove(remaining, startIndex)}
-	while #remaining > 0 do
-		local current = ordered[#ordered]
-		local nearestIndex, nearestDistance = 1, math.huge
-		for index, point in remaining do
-			local distance = (point - current).Magnitude
-			if distance < nearestDistance then
-				nearestIndex, nearestDistance = index, distance
-			end
-		end
-		table.insert(ordered, table.remove(remaining, nearestIndex))
-	end
-	return ordered
-end
-
-local function clickPathPoints(points, reverse)
-	local clicked = 0
-	local first, last, step = 1, #points, 1
-	if reverse then first, last, step = #points, 1, -1 end
-	for index = first, last, step do
-		if not state.autoCarve or state.destroyed then break end
-		local point = points[index]
-		local x, y = math.floor(point.X), math.floor(point.Y)
-		mouseMove(x, y)
-		mouseButton(x, y, true)
-		mouseButton(x, y, false)
-		clicked += 1
-		if clicked % CONFIG.CarveClicksPerYield == 0 then RunService.RenderStepped:Wait() end
-	end
-	return clicked
-end
-
-local function carveLocalPath()
-	if state.destroyed or not state.autoCarve or state.carving then return end
-	local model, path = findLocalPath()
-	if not model or not path or model == state.lastCarvedModel then return end
-
-	state.carving = true
-	setStatus("AUTO CARVE • WAITING FOR CAMERA", Color3.fromRGB(116, 168, 255))
-
-	local ok, clickedOrError = pcall(function()
-		waitForStableCamera()
-		local totalClicked = 0
-		for pass = 1, CONFIG.CarvePasses do
-			if not state.autoCarve or not model.Parent or not path.Parent then break end
-			local camera = Workspace.CurrentCamera
-			local points = camera and orderNearest(collectVisiblePathPoints(path, camera)) or {}
-			if #points == 0 then
-				RunService.RenderStepped:Wait()
-			else
-				setStatus("AUTO CARVE • PASS " .. pass .. "/" .. CONFIG.CarvePasses .. " • " .. #points .. " PARTS", Color3.fromRGB(116, 168, 255))
-				totalClicked += clickPathPoints(points, pass % 2 == 0)
-				RunService.RenderStepped:Wait()
-			end
-		end
-		return totalClicked
-	end)
-
-	state.carving = false
-	if ok and clickedOrError > 0 then
-		state.lastCarvedModel = model
-		setStatus("AUTO CARVE • " .. clickedOrError .. " SAFE CLICKS", Color3.fromRGB(74, 231, 157))
-	else
-		setStatus("AUTO CARVE • NO PATH CLICKS", Color3.fromRGB(255, 99, 119))
-		if not ok then warn("[BunduAdmin] Auto Carve:", clickedOrError) end
-	end
-end
-
-local function queueCarve()
-	if not state.autoCarve then return end
-	task.delay(0.1, carveLocalPath)
-end
-
-local function targetMatchesFilter(candidate, filter)
-	if candidate == player or not candidate.Team or candidate.Team.Name ~= "Player" then return false end
-	filter = string.lower(filter or "")
-	if filter == "" then return true end
-	return string.find(string.lower(candidate.Name), filter, 1, true) ~= nil
-		or string.find(string.lower(candidate.DisplayName), filter, 1, true) ~= nil
-end
-
-setSelectedTarget = function(target)
-	restoreBarriers()
-	releaseCookieLock()
-	state.breakLoopToken += 1
-	state.selectedTarget = target
-	targetResults.Visible = false
-	suppressTargetRefresh = true
-	if not target then
-		targetBox.Text = ""
-		selectedTargetLabel.Text = "NO TARGET SELECTED"
-		selectedHeadshot.Image = ""
-		suppressTargetRefresh = false
-		return
-	end
-	targetBox.Text = target.Name
-	suppressTargetRefresh = false
-	selectedTargetLabel.Text = "TARGET  •  " .. target.DisplayName .. "  (@" .. target.Name .. ")"
-	setStatus("TARGET SELECTED • " .. target.Name:upper(), Color3.fromRGB(237, 117, 151))
-	task.spawn(function()
-		local ok, image = pcall(function()
-			return Players:GetUserThumbnailAsync(target.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
-		end)
-		if ok and state.selectedTarget == target then selectedHeadshot.Image = image end
-	end)
-	if state.barriersRemoved then task.defer(applyBarrierState) end
-	if state.breakCookie then task.defer(startBreakLoop) end
-end
-
-refreshTargetResults = function()
-	for _, child in targetResults:GetChildren() do
-		if child:IsA("GuiButton") then child:Destroy() end
-	end
-	local candidates = {}
-	for _, candidate in Players:GetPlayers() do
-		if targetMatchesFilter(candidate, targetBox.Text) then table.insert(candidates, candidate) end
-	end
-	table.sort(candidates, function(a, b) return string.lower(a.Name) < string.lower(b.Name) end)
-
-	for order, candidate in candidates do
-		local row = new("TextButton", {
-			Size = UDim2.new(1, -10, 0, 39), BackgroundColor3 = Color3.fromRGB(28, 31, 44),
-			BorderSizePixel = 0, AutoButtonColor = false, Text = "", LayoutOrder = order, ZIndex = 21,
-		}, targetResults)
-		corner(row, 8)
-		local avatar = new("ImageLabel", {
-			Position = UDim2.fromOffset(5, 4), Size = UDim2.fromOffset(31, 31),
-			BackgroundColor3 = Color3.fromRGB(43, 46, 61), BorderSizePixel = 0, Image = "", ZIndex = 22,
-		}, row)
-		corner(avatar, 20)
-		new("TextLabel", {
-			Position = UDim2.fromOffset(44, 4), Size = UDim2.new(1, -49, 0, 16), BackgroundTransparency = 1,
-			Text = candidate.DisplayName, TextColor3 = Color3.fromRGB(231, 233, 243), TextSize = 10,
-			Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 22,
-		}, row)
-		new("TextLabel", {
-			Position = UDim2.fromOffset(44, 20), Size = UDim2.new(1, -49, 0, 14), BackgroundTransparency = 1,
-			Text = "@" .. candidate.Name, TextColor3 = Color3.fromRGB(113, 118, 141), TextSize = 8,
-			Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 22,
-		}, row)
-		connect(row.MouseButton1Click, function() setSelectedTarget(candidate) end)
-		task.spawn(function()
-			local ok, image = pcall(function()
-				return Players:GetUserThumbnailAsync(candidate.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		if not eligible(selected) or not main then
+			S.breaking = false
+			widgets.breaking.Set(false)
+		else
+			task.spawn(function()
+				clickPart(main, function()
+					return not S.closed and S.breaking
+						and S.target == selected and not S.carving
+				end)
 			end)
-			if ok and avatar.Parent then avatar.Image = image end
-		end)
-	end
-	targetResults.Visible = true
-end
-
-startBreakLoop = function()
-	state.breakLoopToken += 1
-	local token = state.breakLoopToken
-	task.spawn(function()
-		while not state.destroyed and state.breakCookie and token == state.breakLoopToken do
-			local target = state.selectedTarget
-			local mainPart = targetMain(target)
-			if not target or not target.Parent then
-				state.breakCookie = false
-				renderBreak(false)
-				setStatus("BREAK COOKIE • TARGET LEFT", Color3.fromRGB(242, 175, 85))
-				break
-			elseif mainPart then
-				local detector = mainPart:FindFirstChildWhichIsA("ClickDetector", true)
-				if detector and typeof(fireclickdetector) == "function" then
-					pcall(fireclickdetector, detector)
-				else
-					local camera = Workspace.CurrentCamera
-					local screen, visible = camera:WorldToViewportPoint(mainPart.Position)
-					if visible and screen.Z > 0 then
-						local x, y = math.floor(screen.X), math.floor(screen.Y)
-						pcall(function()
-							mouseMove(x, y)
-							mouseButton(x, y, true)
-							mouseButton(x, y, false)
-						end)
-					end
-				end
-			end
-			task.wait(CONFIG.BreakClickInterval)
 		end
-	end)
-end
-
-connect(targetBox.Focused, refreshTargetResults)
-connect(targetBox:GetPropertyChangedSignal("Text"), function()
-	if not suppressTargetRefresh and targetBox:IsFocused() then refreshTargetResults() end
-end)
-
-connect(barrierCard.MouseButton1Click, function()
-	if not state.selectedTarget then setStatus("SELECT A SABOTAGE TARGET", Color3.fromRGB(242, 175, 85)); return end
-	state.barriersRemoved = not state.barriersRemoved
-	renderBarrier(state.barriersRemoved)
-	applyBarrierState()
-	if not state.barriersRemoved then setStatus("SABOTAGE • BARRIERS RESTORED") end
-end)
-
-connect(lockCard.MouseButton1Click, function()
-	if not state.selectedTarget then setStatus("SELECT A SABOTAGE TARGET", Color3.fromRGB(242, 175, 85)); return end
-	state.cookieLock = not state.cookieLock
-	renderLock(state.cookieLock)
-	if state.cookieLock then
-		setStatus("COOKIE LOCK • " .. state.selectedTarget.Name:upper(), Color3.fromRGB(237, 117, 151))
-	else
-		releaseCookieLock()
-		setStatus("COOKIE LOCK RELEASED")
 	end
-end)
 
-connect(breakCard.MouseButton1Click, function()
-	if not state.selectedTarget then setStatus("SELECT A SABOTAGE TARGET", Color3.fromRGB(242, 175, 85)); return end
-	state.breakCookie = not state.breakCookie
-	renderBreak(state.breakCookie)
-	state.breakLoopToken += 1
-	if state.breakCookie then
-		setStatus("BREAK COOKIE • ACTIVE", Color3.fromRGB(237, 117, 151))
-		startBreakLoop()
-	else
-		setStatus("BREAK COOKIE • STOPPED")
+	maintenanceTime += dt
+	if maintenanceTime < 0.2 then return end
+	maintenanceTime = 0
+
+	trackCharacter()
+	tryBaby()
+	updateHitboxes()
+	checkHealth()
+
+	if S.target and not eligible(S.target) then
+		selectTarget(nil)
 	end
-end)
 
-connect(RunService.RenderStepped, updateCookieLock)
-connect(Players.PlayerAdded, function()
-	if targetResults.Visible then refreshTargetResults() end
-end)
-connect(Players.PlayerRemoving, function(leaving)
-	if state.selectedTarget == leaving then
-		state.barriersRemoved = false
-		state.cookieLock = false
-		state.breakCookie = false
-		renderBarrier(false)
-		renderLock(false)
-		renderBreak(false)
-		setSelectedTarget(nil)
-	elseif targetResults.Visible then
-		refreshTargetResults()
+	if S.barriers then applyBarriers() end
+
+	local _, path = carvePath()
+	if path ~= lastPath then
+		lastPath = path
+		if S.carve and path then
+			task.defer(startCarve)
+		end
 	end
-end)
 
-connect(moveCard.MouseButton1Click, function()
-	state.honeycombEnabled = false
-	state.lastMovedShapeInstance = nil
-	renderMove(false)
-	setStatus("PREFERRED DOOR • PAUSED FOR LATER", Color3.fromRGB(235, 177, 89))
-end)
-
-connect(carveCard.MouseButton1Click, function()
-	state.autoCarve = not state.autoCarve
-	state.lastCarvedModel = nil
-	renderCarve(state.autoCarve)
-	if state.autoCarve then queueCarve() else setStatus("AUTO CARVE DISABLED") end
-end)
-
--- Auto Baby ------------------------------------------------------------------
-
-local babyBusy = false
-activateBaby = function(baby)
-	if state.destroyed or not state.autoBaby or babyBusy or baby.Name ~= CONFIG.BabyName then return end
-	local prompt = baby:FindFirstChild(CONFIG.BabyPromptName, true)
-	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then return end
-	if typeof(fireproximityprompt) ~= "function" then
-		setStatus("AUTO BABY • FIRE UNAVAILABLE", Color3.fromRGB(255, 99, 119))
-		return
+	for prompt in pairs(promptOriginals) do
+		if not prompt:IsDescendantOf(Workspace) then
+			promptOriginals[prompt] = nil
+		end
 	end
-	babyBusy = true
-	prompt.MaxActivationDistance = CONFIG.PromptDistance
-	prompt.RequiresLineOfSight = false
-	prompt.HoldDuration = 0
-	local ok = pcall(fireproximityprompt, prompt)
-	setStatus(ok and "AUTO BABY • PICKED UP" or "AUTO BABY • FAILED", ok and Color3.fromRGB(74, 231, 157) or Color3.fromRGB(255, 99, 119))
-	task.delay(0.25, function() babyBusy = false end)
-end
-
--- Event-driven watchers: no permanent fast loop.
-connect(Workspace.ChildAdded, function(child)
-	if child.Name == CONFIG.BabyName then task.defer(activateBaby, child) end
 end)
 
 connect(Workspace.DescendantAdded, function(object)
-	if state.honeycombEnabled and (SHAPE_SET[object.Name] or object.Name == "Doors") then queueScan() end
-	if state.autoCarve and (object.Name == player.Name or object.Name == "Path") then queueCarve() end
-	if state.barriersRemoved and not barrierMutating and (object.Name == "Walls" or object.Name == "Offlimits") then
-		task.defer(applyBarrierState)
+	if S.baby and (object.Name == "BabyPickup" or object.Name == "PickupPrompt") then
+		task.defer(tryBaby)
+	end
+
+	if S.carve then
+		local _, path = carvePath()
+		if path and (object == path or object:IsDescendantOf(path)) then
+			task.delay(0.25, function()
+				if not S.closed then startCarve() end
+			end)
+		end
 	end
 end)
 
-connect(Workspace.DescendantRemoving, function(object)
-	if object == state.lastMovedShapeInstance then state.lastMovedShapeInstance = nil end
-	if object == state.lastCarvedModel then state.lastCarvedModel = nil end
+local function watchPlayer(other)
+	connect(other:GetPropertyChangedSignal("Team"), function()
+		if S.target == other and not eligible(other) then
+			selectTarget(nil)
+		end
+		refreshTargets()
+	end)
+end
+
+for _, other in ipairs(Players:GetPlayers()) do watchPlayer(other) end
+
+connect(Players.PlayerAdded, function(other)
+	watchPlayer(other)
+	refreshTargets()
 end)
 
--- Window controls ------------------------------------------------------------
-
-connect(minimizeButton.MouseButton1Click, function()
-	state.minimized = not state.minimized
-	local size = state.minimized and UDim2.fromOffset(464, 48) or UDim2.fromOffset(464, 314)
-	local shadowSize = state.minimized and UDim2.fromOffset(474, 58) or UDim2.fromOffset(474, 324)
-	minimizeButton.Text = state.minimized and "+" or "−"
-	sidebar.Visible = not state.minimized
-	pages.Visible = not state.minimized
-	tween(main, {Size = size})
-	tween(shadow, {Size = shadowSize})
+connect(Players.PlayerRemoving, function(other)
+	if S.target == other then selectTarget(nil) end
+	task.defer(refreshTargets)
 end)
 
-local dragging, dragInput, dragStart, startPosition = false, nil, nil, nil
+--==================================================
+-- WINDOW CONTROLS / CLEANUP
+--==================================================
+
+connect(minimizeButton.Activated, function()
+	S.minimized = not S.minimized
+	body.Visible = not S.minimized
+	status.Visible = not S.minimized
+	subtitle.Visible = not S.minimized
+
+	window.Size = UDim2.fromOffset(470, S.minimized and 48 or 490)
+	minimizeButton.Text = S.minimized and "+" or "−"
+end)
+
+local dragging = false
+local dragTouch
+local dragStart
+local windowStart
+
 connect(header.InputBegan, function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		dragging, dragStart, startPosition = true, input.Position, main.Position
-		local ended
-		ended = input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-				ended:Disconnect()
-			end
-		end)
-	end
-end)
-connect(header.InputChanged, function(input)
-	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
-end)
-connect(UserInputService.InputChanged, function(input)
-	if dragging and input == dragInput then
-		local delta = input.Position - dragStart
-		local position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-		main.Position, shadow.Position = position, position
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+
+		dragging = true
+		dragTouch = input.UserInputType == Enum.UserInputType.Touch and input or nil
+		dragStart = input.Position
+		windowStart = window.Position
 	end
 end)
 
-connect(closeButton.MouseButton1Click, function()
-	state.destroyed = true
-	state.breakCookie = false
-	state.cookieLock = false
+connect(UIS.InputChanged, function(input)
+	if not dragging then return end
+
+	if (dragTouch and input == dragTouch)
+		or (not dragTouch and input.UserInputType == Enum.UserInputType.MouseMovement) then
+
+		local delta = input.Position - dragStart
+		window.Position = UDim2.new(
+			windowStart.X.Scale, windowStart.X.Offset + delta.X,
+			windowStart.Y.Scale, windowStart.Y.Offset + delta.Y
+		)
+	end
+end)
+
+connect(UIS.InputEnded, function(input)
+	if input == dragTouch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+		dragTouch = nil
+	end
+end)
+
+local function cleanup()
+	if S.closed then return end
+	S.closed = true
+	S.carve = false
+	S.carveToken += 1
+	S.breaking = false
+	S.lock = false
+	S.escape = false
+	S.hitboxes = false
+	S.baby = false
+
+	stopWalk()
+	releaseMouse()
+	releaseLock()
 	restoreBarriers()
-	releaseCookieLock()
-	for _, connection in connections do connection:Disconnect() end
-	table.clear(connections)
+	restoreHitboxes()
+	restorePrompts()
+
+	disconnectAll(healthConnections)
+	disconnectAll(connections)
+
+	savedReturn = nil
+end
+
+connect(gui.Destroying, cleanup)
+
+connect(closeButton.Activated, function()
+	cleanup()
 	gui:Destroy()
 end)
 
-renderBaby(false)
-renderMove(false)
-renderCarve(false)
-renderBarrier(false)
-renderLock(false)
-renderBreak(false)
-renderShapes()
-switchTab("Misc")
+switchPage("Misc")
+trackCharacter()
+setStatus("Ready • Preferred Door paused")
 print("[BunduAdmin] Loaded")
