@@ -1,38 +1,36 @@
+```lua
 -- AutoBaby.lua
--- Client-side Auto Baby pickup
--- For use in your own Roblox test environment.
+-- Automatically attempts to pick up BabyPickup
+-- Intended for your own Roblox test environment.
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 
-local LocalPlayer = Players.LocalPlayer
-
---==================================================
--- SETTINGS
---==================================================
-
+local player = Players.LocalPlayer
 local Enabled = false
-local GUI_NAME = "AutoBabyGUI"
 
 --==================================================
 -- GUI
 --==================================================
 
-local oldGui = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild(GUI_NAME)
+local playerGui = player:WaitForChild("PlayerGui")
+
+local oldGui = playerGui:FindFirstChild("AutoBabyGUI")
 if oldGui then
     oldGui:Destroy()
 end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = GUI_NAME
+gui.Name = "AutoBabyGUI"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = LocalPlayer.PlayerGui
+gui.Parent = playerGui
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(220, 115)
-main.Position = UDim2.new(0.5, -110, 0.5, -58)
-main.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+main.Size = UDim2.fromOffset(220, 110)
+main.Position = UDim2.new(0.5, -110, 0.5, -55)
+main.BackgroundColor3 = Color3.fromRGB(20, 20, 27)
 main.BorderSizePixel = 0
 main.Parent = gui
 
@@ -41,7 +39,7 @@ corner.CornerRadius = UDim.new(0, 12)
 corner.Parent = main
 
 local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(65, 65, 80)
+stroke.Color = Color3.fromRGB(70, 70, 85)
 stroke.Thickness = 1
 stroke.Parent = main
 
@@ -50,13 +48,13 @@ stroke.Parent = main
 --==================================================
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -45, 0, 35)
+title.Size = UDim2.new(1, -50, 0, 35)
 title.Position = UDim2.fromOffset(15, 5)
 title.BackgroundTransparency = 1
 title.Text = "AUTO BABY"
-title.TextColor3 = Color3.fromRGB(235, 235, 240)
-title.TextSize = 16
+title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
+title.TextSize = 16
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = main
 
@@ -74,24 +72,19 @@ close.TextSize = 22
 close.Font = Enum.Font.GothamBold
 close.Parent = main
 
-close.MouseButton1Click:Connect(function()
-    Enabled = false
-    gui:Destroy()
-end)
-
 --==================================================
 -- TOGGLE
 --==================================================
 
 local toggle = Instance.new("TextButton")
-toggle.Size = UDim2.new(1, -30, 0, 48)
-toggle.Position = UDim2.fromOffset(15, 48)
+toggle.Size = UDim2.new(1, -30, 0, 45)
+toggle.Position = UDim2.fromOffset(15, 50)
 toggle.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
 toggle.BorderSizePixel = 0
 toggle.Text = "AUTO BABY  •  OFF"
 toggle.TextColor3 = Color3.fromRGB(190, 190, 200)
-toggle.TextSize = 14
 toggle.Font = Enum.Font.GothamBold
+toggle.TextSize = 14
 toggle.Parent = main
 
 local toggleCorner = Instance.new("UICorner")
@@ -113,13 +106,18 @@ end
 toggle.MouseButton1Click:Connect(function()
     Enabled = not Enabled
     updateToggle()
+
+    print("[AutoBaby] " .. (Enabled and "Enabled" or "Disabled"))
+end)
+
+close.MouseButton1Click:Connect(function()
+    Enabled = false
+    gui:Destroy()
 end)
 
 --==================================================
 -- DRAGGING
 --==================================================
-
-local UserInputService = game:GetService("UserInputService")
 
 local dragging = false
 local dragStart
@@ -130,12 +128,6 @@ title.InputBegan:Connect(function(input)
         dragging = true
         dragStart = input.Position
         startPosition = main.Position
-
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-            end
-        end)
     end
 end)
 
@@ -152,59 +144,80 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+
 --==================================================
--- BABY PICKUP
+-- FIND BABY PROMPT
 --==================================================
 
-local function getPickupPrompt()
+local function findBabyPrompt()
     local baby = Workspace:FindFirstChild("BabyPickup")
 
     if not baby then
         return nil
     end
 
-    return baby:FindFirstChild("PickupPrompt", true)
-end
+    local prompt = baby:FindFirstChild("PickupPrompt", true)
 
-local function tryPickup()
-    if not Enabled then
-        return
+    if prompt and prompt:IsA("ProximityPrompt") then
+        return prompt
     end
 
-    local prompt = getPickupPrompt()
-
-    if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled then
-        -- Uses the game's normal interaction path.
-        prompt:InputHoldBegin()
-
-        task.wait(prompt.HoldDuration)
-
-        prompt:InputHoldEnd()
-    end
+    return nil
 end
 
 --==================================================
--- WATCH FOR BABY
+-- AUTO PICKUP LOOP
 --==================================================
-
-Workspace.ChildAdded:Connect(function(child)
-    if child.Name == "BabyPickup" then
-        task.wait(0.1)
-        tryPickup()
-    end
-end)
-
--- Also check periodically in case BabyPickup
--- already existed when the script started.
 
 task.spawn(function()
+    local lastPrompt = nil
+    local lastAttempt = 0
+
     while gui.Parent do
         if Enabled then
-            tryPickup()
+            local prompt = findBabyPrompt()
+
+            if prompt then
+                if prompt ~= lastPrompt then
+                    print("[AutoBaby] BabyPickup detected")
+                    print("[AutoBaby] Prompt found:", prompt:GetFullName())
+
+                    lastPrompt = prompt
+                end
+
+                if prompt.Enabled then
+                    local now = os.clock()
+
+                    -- Prevent firing the same prompt hundreds of times/sec.
+                    if now - lastAttempt >= 0.15 then
+                        lastAttempt = now
+
+                        if typeof(fireproximityprompt) == "function" then
+                            print("[AutoBaby] Firing PickupPrompt")
+                            fireproximityprompt(prompt)
+                        else
+                            warn(
+                                "[AutoBaby] fireproximityprompt is unavailable in this executor"
+                            )
+                            task.wait(1)
+                        end
+                    end
+                end
+            else
+                lastPrompt = nil
+            end
         end
 
-        task.wait(0.25)
+        task.wait(0.05)
     end
 end)
 
 updateToggle()
+
+print("[AutoBaby] Loaded successfully")
+```
